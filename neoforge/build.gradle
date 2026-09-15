@@ -1,3 +1,8 @@
+import groovy.json.JsonSlurper
+
+import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+
 plugins {
     id "com.github.johnrengelman.shadow"
     id "me.modmuss50.mod-publish-plugin" version "2.1.1"
@@ -40,8 +45,13 @@ dependencies {
     common(project(path: ':common', configuration: 'namedElements')) { transitive false }
     shadowBundle project(path: ':common', configuration: 'transformProductionNeoForge')
 
-    implementation "org.xerial:sqlite-jdbc:3.47.2.0"
-    shadowBundle "org.xerial:sqlite-jdbc:3.47.2.0"
+    implementation(include("org.xerial:sqlite-jdbc:3.47.2.0")) {
+        version {
+            // NeoForge Jar-in-Jar selects one driver when another mod provides it.
+            strictly "[3.47.2.0,4.0)"
+            prefer "3.47.2.0"
+        }
+    }
 
     implementation "com.mysql:mysql-connector-j:8.4.0"
     shadowBundle "com.mysql:mysql-connector-j:8.4.0"
@@ -64,6 +74,8 @@ processResources {
 shadowJar {
     exclude "architectury.common.json"
     exclude "org/slf4j/**"
+    // SQLite must never be flat-shaded into the outer NeoForge mod JAR.
+    exclude "org/sqlite/**"
 
     configurations = [project.configurations.shadowBundle]
     archiveClassifier = "neoforge-dev-shadow"
@@ -76,6 +88,61 @@ remapJar {
 
 remapSourcesJar {
     archiveClassifier = "neoforge-sources"
+}
+
+tasks.register("verifyNeoForgeJarInJarPackaging") {
+    dependsOn remapJar
+    inputs.file(remapJar.archiveFile)
+
+    doLast {
+        def artifact = remapJar.archiveFile.get().asFile
+        new ZipFile(artifact).withCloseable { outerJar ->
+            if (outerJar.entries().any { it.name.startsWith("org/sqlite/") }) {
+                throw new GradleException("SQLite classes leaked into the outer NeoForge JAR")
+            }
+
+            def metadataEntry = outerJar.getEntry("META-INF/jarjar/metadata.json")
+            if (metadataEntry == null) {
+                throw new GradleException("NeoForge Jar-in-Jar metadata is missing")
+            }
+            def metadata = new JsonSlurper().parse(outerJar.getInputStream(metadataEntry))
+            def sqlite = metadata.find { it.identifier.group == "org.xerial" && it.identifier.artifact == "sqlite-jdbc" }
+            if (sqlite == null) {
+                throw new GradleException("SQLite is missing from NeoForge Jar-in-Jar metadata")
+            }
+            if (sqlite.version.range != "[3.47.2.0,4.0)" || sqlite.version.artifactVersion != "3.47.2.0") {
+                throw new GradleException("SQLite Jar-in-Jar metadata does not declare the supported range and preferred version")
+            }
+
+            def sqliteEntry = outerJar.getEntry(sqlite.path as String)
+            if (sqliteEntry == null) {
+                throw new GradleException("Nested SQLite driver is missing from the NeoForge JAR")
+            }
+            new ZipInputStream(outerJar.getInputStream(sqliteEntry)).withCloseable { sqliteJar ->
+                def entries = []
+                for (def entry = sqliteJar.nextEntry; entry != null; entry = sqliteJar.nextEntry) {
+                    entries.add(entry.name)
+                }
+                if (!entries.contains("org/sqlite/JDBC.class")) {
+                    throw new GradleException("Nested SQLite driver does not contain org.sqlite.JDBC")
+                }
+                if (!entries.contains("META-INF/services/java.sql.Driver")) {
+                    throw new GradleException("Nested SQLite driver does not contain its JDBC service descriptor")
+                }
+                if (!entries.any { it.startsWith("org/sqlite/native/") }) {
+                    throw new GradleException("Nested SQLite driver does not contain native SQLite libraries")
+                }
+            }
+
+            if (outerJar.getEntry("com/mysql/cj/jdbc/Driver.class") == null) {
+                throw new GradleException("MySQL driver is missing from the NeoForge JAR")
+            }
+        }
+    }
+}
+
+tasks.named("check") {
+    dependsOn verifyNeoForgeJarInJarPackaging
 }
 
 apply from: rootProject.file("gradle/scripts/publishing.gradle")
